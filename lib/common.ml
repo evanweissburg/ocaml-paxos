@@ -1,15 +1,21 @@
 open Core
 open Async
 
-type replica_spec = {host: string; port: int; reliable: bool}
+type replica_spec = {host: string; port: int; reliable: bool; recv_disabled: bool}
 
-let default_replica_set ?(reliable=false) () = 
+let default_replica_set ?(reliable=false) ?(recv_disabled=false) () = 
   [
-    {host="127.0.0.1"; port=8765; reliable};
-    {host="127.0.0.1"; port=8766; reliable};
-    {host="127.0.0.1"; port=8767; reliable};
+    {host="127.0.0.1"; port=8765; reliable; recv_disabled=false};
+    {host="127.0.0.1"; port=8766; reliable; recv_disabled=false};
+    {host="127.0.0.1"; port=8767; reliable; recv_disabled};
   ]
 let num_replicas ~replica_set = List.length replica_set
+
+let is_majority ~replica_set n = 
+  let float_n = float_of_int n in 
+  let float_majority = float_of_int (num_replicas ~replica_set) /. 2. in
+  Float.(float_n > float_majority)
+
 let replica_of_id ~replica_set ~id = 
   match List.nth replica_set id with 
   | Some replica -> replica

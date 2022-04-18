@@ -22,7 +22,9 @@ let instance ~instances seq =
     match Hashtbl.add instances ~key:seq ~data:instance with 
     | `Duplicate | `Ok -> instance
 
-let prepare_impl ~id ~max ~instances () (args : Protocol.prepare_args) =
+let prepare_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.prepare_args) =
+  let replica = Common.replica_of_id ~replica_set ~id in 
+  if replica.recv_disabled then failwith "Recv disabled" else
   if args.seq > !max then max := args.seq else ();
   let instance = instance ~instances args.seq in 
   if args.n > !(instance.n_p) then (
@@ -34,7 +36,9 @@ let prepare_impl ~id ~max ~instances () (args : Protocol.prepare_args) =
     return Protocol.PrepareReject
   )
 
-let accept_impl ~id ~max ~instances () (args : Protocol.accept_args) =
+let accept_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.accept_args) =
+  let replica = Common.replica_of_id ~replica_set ~id in 
+  if replica.recv_disabled then failwith "Recv disabled" else
   if args.seq > !max then max := args.seq else ();
   let instance = instance ~instances args.seq in 
   if args.n >= !(instance.n_p) then (
@@ -49,11 +53,11 @@ let accept_impl ~id ~max ~instances () (args : Protocol.accept_args) =
     return Protocol.AcceptReject
   )
 
-let propose_impl ~id ~max ~(replica_set:Common.replica_spec list) ~n ~instances () (args:Protocol.propose_args) =
+let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances () (args:Protocol.propose_args) =
   let num_replicas = Common.num_replicas ~replica_set in
+  let is_majority = Common.is_majority ~replica_set in 
   let inc_n n' = 
     n := (1 + n' / num_replicas) * num_replicas + id in
-  let num_majority = float_of_int num_replicas /. 2. in
   let broadcast_replicas ~rpc ~local ~args = 
     List.map replica_set ~f:(fun replica ->
     let self = Common.replica_of_id ~replica_set ~id in
@@ -93,12 +97,12 @@ let propose_impl ~id ~max ~(replica_set:Common.replica_spec list) ~n ~instances 
               loop (max_n, max_v, max_count) (n, v, 1) tl
           ) in
       let max_v, count = loop (-1, "", 0) (-1, "", 0) sorted_accepts in
-      if Float.(float_of_int count > num_majority) then Some max_v else None in
+      if is_majority count then Some max_v else None in
     match majority_value with 
       | Some value -> MajorityExists value
       | None -> 
         let num_supporting, max_n, max_v = (List.fold_right results ~f:check_support ~init:(0, -1, args.v)) in
-        if Float.(float_of_int num_supporting > num_majority) then
+        if is_majority num_supporting then
           Supported max_v
         else 
           NotSupported max_n
@@ -111,13 +115,13 @@ let propose_impl ~id ~max ~(replica_set:Common.replica_spec list) ~n ~instances 
       | Ok Protocol.AcceptReject | Error _ -> aux
     in 
     let num_supporting = (List.fold_right results ~f ~init:0) in
-    Float.(float_of_int num_supporting > num_majority)
+    is_majority num_supporting
   in 
 
   let rec propose_aux () = 
     let n' = !n in
     Log.Global.debug "%d proposing %s on %d" id args.v n';
-    let%bind results = Deferred.all (broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:(prepare_impl ~id ~max ~instances) ~args:{seq=args.seq; n=n'}) in
+    let%bind results = Deferred.all (broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:(prepare_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; n=n'}) in
     match prepare_supported results with 
       | MajorityExists value -> return value
       | NotSupported n'' ->
@@ -125,7 +129,7 @@ let propose_impl ~id ~max ~(replica_set:Common.replica_spec list) ~n ~instances 
         propose_aux ()
       | Supported v ->
         let%bind results = 
-          Deferred.all (broadcast_replicas ~rpc:Protocol.accept_rpc ~local:(accept_impl ~id ~max ~instances) ~args:{seq=args.seq; n=n'; v=v})
+          Deferred.all (broadcast_replicas ~rpc:Protocol.accept_rpc ~local:(accept_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; n=n'; v=v})
         in
         if not (accept_supported results) then (
           inc_n n';
@@ -137,8 +141,8 @@ let propose_impl ~id ~max ~(replica_set:Common.replica_spec list) ~n ~instances 
 
 (* The list of RPC implementations supported by this server *)
 let implementations ~id ~replica_set ~n ~max ~instances=
-  [ Rpc.Rpc.implement Protocol.prepare_rpc (prepare_impl ~id ~max ~instances);
-    Rpc.Rpc.implement Protocol.accept_rpc (accept_impl ~id ~max ~instances);
+  [ Rpc.Rpc.implement Protocol.prepare_rpc (prepare_impl ~id ~replica_set ~max ~instances);
+    Rpc.Rpc.implement Protocol.accept_rpc (accept_impl ~id ~replica_set ~max ~instances);
     Rpc.Rpc.implement Protocol.propose_rpc (propose_impl ~id ~max ~replica_set ~n ~instances); ]
 
 type instance_status = 
