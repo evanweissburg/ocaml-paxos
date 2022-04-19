@@ -7,51 +7,70 @@ open Async
    query whose implementation blocks.
 *)
 
-type instance = {n_p: int ref; n_a: int option ref; v_a: string option ref; decided: bool ref}
+type instance = 
+  | Decided of string
+  | Pending of {n_p: int ref; n_a: int option ref; v_a: string option ref}
 
 type prepare_result =
-  | MajorityExists of string
+  | WasDecided of string
   | Supported of string
   | NotSupported of int
 
-let instance ~instances seq = 
+let get_instance ~instances seq = 
   match Hashtbl.find instances seq with
   | Some instance -> instance
   | None -> 
-    let instance = {n_p=ref 0; n_a=ref None; v_a=ref None; decided=ref false} in
+    let instance = Pending {n_p=ref 0; n_a=ref None; v_a=ref None} in
     match Hashtbl.add instances ~key:seq ~data:instance with 
     | `Duplicate | `Ok -> instance
+
+let decide_instance ~instances ~seq ~v =
+  let decided = Decided v in
+  Hashtbl.change instances seq ~f:(fun instance -> 
+    match instance with 
+    | Some instance -> (
+      match instance with 
+        | Decided v' -> if String.(v <> v') then failwith "Instance already decided!" else Some decided
+        | Pending _ -> Some decided
+    )
+    | None -> Some decided)
 
 let prepare_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.prepare_args) =
   let replica = Common.replica_of_id ~replica_set ~id in 
   if replica.recv_disabled then failwith "Recv disabled" else
-  if args.seq > !max then max := args.seq else ();
-  let instance = instance ~instances args.seq in 
-  if args.n > !(instance.n_p) then (
-    instance.n_p := args.n;
-    Log.Global.debug "%d accepted prepare (n: %d)" id args.n;
-    return (Protocol.PrepareOk (args.n, !(instance.n_a), !(instance.v_a)))
-  ) else (
-    Log.Global.debug "%d rejected prepare (n: %d)" id args.n;
-    return Protocol.PrepareReject
-  )
+  if args.seq > !max then max := args.seq;
+  match get_instance ~instances args.seq with
+    | Decided v -> return (Protocol.PrepareDecided v)
+    | Pending instance -> 
+      if args.n > !(instance.n_p) then (
+        instance.n_p := args.n;
+        Log.Global.debug "%d accepted prepare (n: %d)" id args.n;
+        return (Protocol.PrepareOk (args.n, !(instance.n_a), !(instance.v_a)))
+      ) else (
+        return Protocol.PrepareReject
+      )
 
 let accept_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.accept_args) =
   let replica = Common.replica_of_id ~replica_set ~id in 
   if replica.recv_disabled then failwith "Recv disabled" else
-  if args.seq > !max then max := args.seq else ();
-  let instance = instance ~instances args.seq in 
-  if args.n >= !(instance.n_p) then (
-    Log.Global.debug "%d accepted accept (n: %d, v: %s)" id args.n args.v;
-    instance.n_p := args.n;
-    instance.n_a := Some args.n;
-    instance.v_a := Some args.v;
-    instance.decided := true;
-    return (Protocol.AcceptOk args.n)
-  ) else (
-    Log.Global.debug "%d rejected accept (n: %d, v: %s)" id args.n args.v;
-    return Protocol.AcceptReject
-  )
+  if args.seq > !max then max := args.seq;
+  match get_instance ~instances args.seq with
+    | Decided _ -> return Protocol.AcceptReject
+    | Pending instance ->
+      if args.n >= !(instance.n_p) then (
+        Log.Global.debug "%d accepted accept (n: %d, v: %s)" id args.n args.v;
+        decide_instance ~instances ~seq:args.seq ~v:args.v;
+        return (Protocol.AcceptOk args.n)
+      ) else (
+        return Protocol.AcceptReject
+      )
+
+let learn_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.learn_args) =
+  let replica = Common.replica_of_id ~replica_set ~id in 
+  if replica.recv_disabled then failwith "Recv disabled" else 
+  if args.seq > !max then max := args.seq;
+  decide_instance ~instances ~seq:args.seq ~v:args.v;
+  return ()
 
 let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances () (args:Protocol.propose_args) =
   let num_replicas = Common.num_replicas ~replica_set in
@@ -70,6 +89,14 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
   in
 
   let prepare_supported results = 
+    let decided = List.filter results ~f:(fun result ->
+      match result with 
+        | Ok Protocol.PrepareDecided _ -> true
+        | _ -> false) 
+    in
+    match decided with 
+      | (Ok Protocol.PrepareDecided v)::_ -> WasDecided v
+      | _ ->
     let check_support result (num_ok, max_n, max_v) =
       match result with 
       | Ok Protocol.PrepareOk (_, n, v) -> 
@@ -78,6 +105,7 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
           | _ -> (num_ok + 1, max_n, max_v)
         )
       | Ok Protocol.PrepareReject | Error _ -> (num_ok, max_n, max_v)
+      | Ok Protocol.PrepareDecided _ -> failwith "Impossible"
     in
     let majority_value = 
       let filter_ok acc = function
@@ -99,7 +127,7 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
       let max_v, count = loop (-1, "", 0) (-1, "", 0) sorted_accepts in
       if is_majority count then Some max_v else None in
     match majority_value with 
-      | Some value -> MajorityExists value
+      | Some value -> WasDecided value
       | None -> 
         let num_supporting, max_n, max_v = (List.fold_right results ~f:check_support ~init:(0, -1, args.v)) in
         if is_majority num_supporting then
@@ -120,10 +148,11 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
 
   let rec propose_aux () = 
     let n' = !n in
-    Log.Global.debug "%d proposing %s on %d" id args.v n';
     let%bind results = Deferred.all (broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:(prepare_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; n=n'}) in
     match prepare_supported results with 
-      | MajorityExists value -> return value
+      | WasDecided v -> 
+        decide_instance ~instances ~seq:args.seq ~v;
+        return v
       | NotSupported n'' ->
         inc_n (if n' > n'' then n' else n'');
         propose_aux ()
@@ -134,8 +163,10 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
         if not (accept_supported results) then (
           inc_n n';
           propose_aux ()
-        ) else 
+        ) else (
+          let%bind _ = Deferred.all (broadcast_replicas ~rpc:Protocol.learn_rpc ~local:(learn_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; v}) in
           return v
+        )
   in
   propose_aux ()
 
@@ -146,9 +177,9 @@ let implementations ~id ~replica_set ~n ~max ~instances=
     Rpc.Rpc.implement Protocol.propose_rpc (propose_impl ~id ~max ~replica_set ~n ~instances); ]
 
 type instance_status = 
-  | Decided of string
-  | Pending
-  | Forgotten
+  | DecidedStatus of string
+  | PendingStatus
+  | ForgottenStatus
 
 type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status;}
 
@@ -157,15 +188,11 @@ let minimum ~min () = !min
 let maximum ~max () = !max
 
 let status ~min ~instances seq = 
-  if seq < !min then Forgotten else 
+  if seq < !min then ForgottenStatus else 
     match Hashtbl.find instances seq with 
-    | Some instance -> (
-      match !(instance.decided), !(instance.v_a) with 
-      | true, Some v_a -> Decided v_a
-      | true, None -> failwith "Decided but no value!"
-      | false, _ -> Pending
-    )
-    | None -> Forgotten
+    | Some Decided v -> DecidedStatus v
+    | Some Pending _ -> PendingStatus
+    | None -> Log.Global.info "forgotten"; ForgottenStatus
 
 let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec list) () =
   let port = (Common.replica_of_id ~id ~replica_set).port in

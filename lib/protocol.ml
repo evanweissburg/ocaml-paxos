@@ -22,6 +22,7 @@ type prepare_args = {seq: int; n: int}
 
 type prepare_reply =
   | PrepareOk of int * int option * string option
+  | PrepareDecided of string
   | PrepareReject
   [@@deriving bin_io]
 
@@ -31,6 +32,12 @@ type accept_args = {seq: int; n: int; v: string}
 type accept_reply =
   | AcceptOk of int
   | AcceptReject
+  [@@deriving bin_io]
+
+type learn_args = {seq: int; v: string}
+  [@@deriving bin_io]
+
+type learn_reply = unit
   [@@deriving bin_io]
 
 let propose_rpc =
@@ -53,3 +60,10 @@ let accept_rpc =
     ~version:0
     ~bin_query:[%bin_type_class: accept_args]
     ~bin_response:[%bin_type_class: accept_reply]
+
+let learn_rpc =
+  Rpc.Rpc.create
+    ~name:"learn"
+    ~version:0
+    ~bin_query:[%bin_type_class: learn_args]
+    ~bin_response:[%bin_type_class: learn_reply]
