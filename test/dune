@@ -1,7 +1,0 @@
-(library
- (name paxos_test)
- (libraries lib core async)
- (preprocess
-  (pps ppx_jane))
- (inline_tests
-  (deps ../bin/run_client.exe ../bin/run_replica.exe)))
