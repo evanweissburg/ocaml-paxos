@@ -1,8 +1,6 @@
 open! Core
 open! Async
 
-(* A command that sends the hello request  *)
-
 let command =
   Command.async
     ~summary:"Client"

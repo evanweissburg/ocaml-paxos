@@ -1,12 +1,6 @@
 open Core
 open Async
 
-(* The implementation of the "hello" RPC.  The first argument is the environment
-   the query executes against, which in this case is trivial.
-   The RPC waits a 10th of a second before responding just to show how you do a
-   query whose implementation blocks.
-*)
-
 type instance = 
   | Decided of string
   | Pending of {n_p: int ref; n_a: int option ref; v_a: string option ref}

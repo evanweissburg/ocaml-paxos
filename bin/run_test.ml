@@ -1,9 +1,6 @@
 open Core
 open Async
 
-(* The command-line interface.  We use [async_basic] so that the command starts
-   the async scheduler, and exits when the server stops.  *)
-
 let count_decided ~(handles:Lib.Replica.handle list) ~seq ~allowed_vals = 
   let statuses = List.map handles ~f:(fun handle -> handle.status seq) in 
   let filter_decided acc = function
