@@ -2,12 +2,13 @@ open Core
 open Async
 
 type replica_spec = {host: string; port: int; reliable: bool; recv_disabled: bool}
+exception RPCFailure
 
-let default_replica_set ?(reliable=false) ?(recv_disabled=false) () = 
+let default_replica_set ?(reliable=true) ?(num_recv_disabled=0) () = 
   [
-    {host="127.0.0.1"; port=8765; reliable; recv_disabled=false};
-    {host="127.0.0.1"; port=8766; reliable; recv_disabled=false};
-    {host="127.0.0.1"; port=8767; reliable; recv_disabled};
+    {host="127.0.0.1"; port=8765; reliable; recv_disabled=(num_recv_disabled >= 3)};
+    {host="127.0.0.1"; port=8766; reliable; recv_disabled=(num_recv_disabled >= 2)};
+    {host="127.0.0.1"; port=8767; reliable; recv_disabled=(num_recv_disabled >= 1)};
   ]
 let num_replicas ~replica_set = List.length replica_set
 
@@ -27,7 +28,7 @@ let host_port_of_replica replica =
 let with_rpc_conn ~host ~port ~reliable f =
   try_with (fun () ->
   let rand_num = Random.int 100 in
-  if not reliable && rand_num < 40 then failwith "Faulty forwards RPC error"
+  if not reliable && rand_num < 10 then raise RPCFailure
   else 
   Tcp.with_connection
     (Tcp.Where_to_connect.of_host_and_port
@@ -37,7 +38,7 @@ let with_rpc_conn ~host ~port ~reliable f =
        match%bind Rpc.Connection.create r w ~connection_state:(fun _ -> ()) with
        | Error exn -> raise exn
        | Ok conn   -> 
-        if not reliable && rand_num < 80 then failwith "Faulty backwards RPC error"
+        if not reliable && rand_num < 20 then raise RPCFailure
         else f conn
     )
   )
@@ -45,4 +46,9 @@ let with_rpc_conn ~host ~port ~reliable f =
 let rec with_retrying_rpc_conn ~host ~port ?(reliable=true) f =
   match%bind with_rpc_conn ~host ~port ~reliable f with
   | Ok reply -> return reply
-  | Error _ -> with_retrying_rpc_conn ~host ~port ~reliable f
+  | Error RPCFailure -> 
+    let%bind () = Clock.after (sec 0.5) in
+    with_retrying_rpc_conn ~host ~port ~reliable f
+  | Error err -> 
+    Log.Global.error "%s" (Exn.to_string err);
+    return ""
