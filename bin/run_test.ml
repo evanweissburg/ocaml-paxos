@@ -2,7 +2,7 @@ open Core
 open Async
 
 let start_replicas ~stop ~replica_set  =
-  Deferred.all (List.mapi replica_set ~f:(fun id -> fun _ ->
+  Deferred.all (List.init (List.length replica_set) ~f:(fun id -> 
     Lib.Replica.start ~env:() ~stop ~id:id ~replica_set ()))
 
 let propose_values ~replica_set ~seq ~values =
@@ -107,8 +107,8 @@ let test_unreliable ~stop () =
   let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
   wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages
 
-let test_many_replicas_unreliable ~stop () =
-  Log.Global.printf "TEST: test_many_replicas_unreliable";
+let test_large_cluster_unreliable ~stop () =
+  Log.Global.printf "TEST: test_large_cluster_unreliable";
   let replica_set = Lib.Common.([
     {host="127.0.0.1"; port=8765; reliable=false; recv_disabled=false};
     {host="127.0.0.1"; port=8766; reliable=false; recv_disabled=false};
@@ -121,6 +121,15 @@ let test_many_replicas_unreliable ~stop () =
   let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
   wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages
 
+let test_many_unreliable ~stop () =
+  Log.Global.printf "TEST: test_many_unreliable";
+  let replica_set = Lib.Common.default_replica_set ~reliable:false () in
+  let%bind handles = start_replicas ~stop ~replica_set in
+  let messages = ["a"; "b"; "c"] in 
+  Deferred.List.iter ?how:(Some `Sequential) (List.init 50 ~f:Fun.id) ~f:(fun seq -> 
+    let%bind _ = propose_values ~replica_set ~seq ~values:messages in
+    wait_majority_decided ~handles ~seq ~allowed_vals:messages)
+
 let run = 
   Log.Global.set_level `Info;
   let tests = [
@@ -128,7 +137,8 @@ let run =
     test_propose_values;
     test_limp;
     test_unreliable;
-    test_many_replicas_unreliable;
+    test_large_cluster_unreliable;
+    test_many_unreliable;
   ] in
   let runnable_tests = List.fold tests ~init:(return ()) ~f:(fun acc test -> 
     let stop_ivar = Ivar.create () in
