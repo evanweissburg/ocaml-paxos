@@ -6,8 +6,9 @@ let start_replicas ~stop ~replica_set  =
     Lib.Replica.start ~env:() ~stop ~id:id ~replica_set ()))
 
 let propose_values ~replica_set ~seq ~values =
-  Deferred.all (List.map values ~f:(fun proposal ->
-    let replica = Lib.Common.replica_of_id ~replica_set ~id:(Random.int (Lib.Common.num_replicas ~replica_set)) in 
+  Deferred.all (List.mapi values ~f:(fun i -> fun proposal ->
+    let replica_id = i % (Lib.Common.num_replicas ~replica_set) in
+    let replica = Lib.Common.replica_of_id ~replica_set ~id:replica_id in 
     let host, port = Lib.Common.host_port_of_replica replica in
     Lib.Client.propose ~host ~port {seq=seq; v=proposal}
    ))

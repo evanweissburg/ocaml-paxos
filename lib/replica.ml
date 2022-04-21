@@ -33,7 +33,6 @@ let decide_instance ~instances ~seq ~v =
 let prepare_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.prepare_args) =
   let replica = Common.replica_of_id ~replica_set ~id in 
   if replica.recv_disabled then raise Common.RPCFailure;
-  Log.Global.debug "%d got prepare (n: %d)" id args.n;
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
     | Decided v -> return (Protocol.PrepareDecided v)
@@ -49,7 +48,6 @@ let prepare_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () 
 let accept_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.accept_args) =
   let replica = Common.replica_of_id ~replica_set ~id in 
   if replica.recv_disabled then raise Common.RPCFailure;
-  Log.Global.debug "%d got accept (n: %d, v: %s)" id args.n args.v;
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
     | Decided _ -> return Protocol.AcceptReject
@@ -78,14 +76,15 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
     n := (1 + n' / num_replicas) * num_replicas + id 
   in
   let broadcast_replicas ~rpc ~local ~args = 
-    List.map replica_set ~f:(fun replica ->
-    let self = Common.replica_of_id ~replica_set ~id in
-    if replica.port <> self.port then 
-      let host, port = Common.host_port_of_replica replica in
-      Common.with_rpc_conn ~host ~port ~reliable:self.reliable (fun conn -> 
-        Rpc.Rpc.dispatch_exn rpc conn args)
-      else try_with (fun () -> local () args)
-    )
+    Deferred.all (
+      List.map replica_set ~f:(fun replica ->
+      let self = Common.replica_of_id ~replica_set ~id in
+      if replica.port <> self.port then 
+        let host, port = Common.host_port_of_replica replica in
+        Common.with_rpc_conn ~host ~port ~reliable:self.reliable (fun conn -> 
+          Rpc.Rpc.dispatch_exn rpc conn args)
+        else try_with (fun () -> local () args)
+    ))
   in
 
   let prepare_supported results = 
@@ -148,28 +147,24 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
 
   let rec propose_aux () = 
     let n' = !n in
-    Log.Global.debug "%d starting prepare" id;
-    let%bind results = Deferred.all (broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:(prepare_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; n=n'}) in
+    let local_prepare_impl = prepare_impl ~id ~replica_set ~max ~instances in
+    let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:{seq=args.seq; n=n'} in
     match prepare_supported results with 
       | WasDecided v -> 
-        Log.Global.debug "%d prepare was already decided" id;
         decide_instance ~instances ~seq:args.seq ~v;
         return v
       | NotSupported n'' ->
-        Log.Global.debug "%d prepare was not supported" id;
         inc_n (if n' > n'' then n' else n'');
         propose_aux ()
       | Supported v ->
-        Log.Global.debug "%d prepare was supported" id;
-        let%bind results = 
-          Deferred.all (broadcast_replicas ~rpc:Protocol.accept_rpc ~local:(accept_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; n=n'; v=v})
-        in
+        let local_accept_impl = accept_impl ~id ~replica_set ~max ~instances in
+        let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:{seq=args.seq; n=n'; v=v} in
         if not (accept_supported results) then (
           inc_n n';
           propose_aux ()
         ) else (
-          Log.Global.debug "%d accept was supported, sending learns" id;
-          let%bind _ = Deferred.all (broadcast_replicas ~rpc:Protocol.learn_rpc ~local:(learn_impl ~id ~replica_set ~max ~instances) ~args:{seq=args.seq; v}) in
+          let local_learn_impl = learn_impl ~id ~replica_set ~max ~instances in
+          let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
           return v
         )
   in
@@ -195,7 +190,6 @@ let minimum ~min () = !min
 let maximum ~max () = !max
 
 let status ~min ~instances seq = 
-  Log.Global.debug "Asking for status";
   if seq < !min then ForgottenStatus else 
     match Hashtbl.find instances seq with 
     | Some Decided v -> DecidedStatus v
