@@ -87,8 +87,11 @@ let test_propose_values ~stop () =
   let messages = ["a"; "b"; "c"] in 
   let%bind commits = propose_values ~replica_set ~seq:0 ~values:messages in
   let _ : unit list = List.map commits ~f:(fun commit -> 
-    if not (List.exists messages ~f:(fun message -> String.(message = commit))) then 
-      failwith "Non-message commit found!") in
+    (match commit with 
+    | Some v -> 
+      if not (List.exists messages ~f:(fun message -> String.(message = v))) 
+        then failwith "Non-message commit found!"
+    | None -> failwith "RPC failed in unknown way")) in
   wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages
 
 let test_limp ~stop () = 

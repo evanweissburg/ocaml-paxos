@@ -1,8 +1,9 @@
 open Core
 open Async
 
-type replica_spec = {address: Host_and_port.t; reliable: bool; recv_disabled: bool}
 exception RPCFailure
+
+type replica_spec = {address: Host_and_port.t; reliable: bool; recv_disabled: bool}
 
 let default_replica_set ?(reliable=true) ?(num_recv_disabled=0) () = 
   [
@@ -41,10 +42,10 @@ let with_rpc_conn ~address ~reliable f =
   
 let rec with_retrying_rpc_conn ~address ?(reliable=true) f =
   match%bind with_rpc_conn ~address ~reliable f with
-  | Ok reply -> return reply
+  | Ok reply -> return (Some reply)
   | Error RPCFailure -> 
     let%bind () = Clock.after (sec 0.5) in
     with_retrying_rpc_conn ~address ~reliable f
   | Error err -> 
     Log.Global.error "%s" (Exn.to_string err);
-    return ""
+    return None
