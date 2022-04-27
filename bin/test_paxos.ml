@@ -5,12 +5,11 @@ let start_replicas ~stop ~replica_set  =
   Deferred.all (List.init (List.length replica_set) ~f:(fun id -> 
     Lib.Replica.start ~env:() ~stop ~id:id ~replica_set ()))
 
-let propose_values ~replica_set ~seq ~values =
-  Deferred.all (List.mapi values ~f:(fun i -> fun proposal ->
+let propose_values ~(replica_set:Lib.Common.replica_spec list) ~seq ~values =
+  Deferred.all (List.mapi values ~f:(fun i proposal ->
     let replica_id = i % (Lib.Common.num_replicas ~replica_set) in
     let replica = Lib.Common.replica_of_id ~replica_set ~id:replica_id in 
-    let host, port = Lib.Common.host_port_of_replica replica in
-    Lib.Client.propose ~host ~port {seq=seq; v=proposal}
+    Lib.Client.propose ~address:replica.address {seq=seq; v=proposal}
    ))
 
 let count_decided ~(handles:Lib.Replica.handle list) ~seq ~allowed_vals = 
@@ -111,11 +110,11 @@ let test_unreliable ~stop () =
 let test_large_cluster_unreliable ~stop () =
   Log.Global.printf "TEST: test_large_cluster_unreliable";
   let replica_set = Lib.Common.([
-    {host="127.0.0.1"; port=8765; reliable=false; recv_disabled=false};
-    {host="127.0.0.1"; port=8766; reliable=false; recv_disabled=false};
-    {host="127.0.0.1"; port=8767; reliable=false; recv_disabled=false};
-    {host="127.0.0.1"; port=8768; reliable=false; recv_disabled=false};
-    {host="127.0.0.1"; port=8769; reliable=false; recv_disabled=false};
+    {address={host="127.0.0.1"; port=8765}; reliable=false; recv_disabled=false};
+    {address={host="127.0.0.1"; port=8766}; reliable=false; recv_disabled=false};
+    {address={host="127.0.0.1"; port=8767}; reliable=false; recv_disabled=false};
+    {address={host="127.0.0.1"; port=8768}; reliable=false; recv_disabled=false};
+    {address={host="127.0.0.1"; port=8769}; reliable=false; recv_disabled=false};
   ]) in
   let%bind handles = start_replicas ~stop ~replica_set in
   let messages = ["a"; "b"; "c"] in 
@@ -127,7 +126,7 @@ let test_many_unreliable ~stop () =
   let replica_set = Lib.Common.default_replica_set ~reliable:false () in
   let%bind handles = start_replicas ~stop ~replica_set in
   let messages = ["a"; "b"; "c"] in 
-  Deferred.List.iter ?how:(Some `Sequential) (List.init 50 ~f:Fun.id) ~f:(fun seq -> 
+  Deferred.List.iter ?how:(Some `Parallel) (List.init 50 ~f:Fun.id) ~f:(fun seq -> 
     let%bind _ = propose_values ~replica_set ~seq ~values:messages in
     wait_majority_decided ~handles ~seq ~allowed_vals:messages)
 

@@ -79,9 +79,8 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
     Deferred.all (
       List.map replica_set ~f:(fun replica ->
       let self = Common.replica_of_id ~replica_set ~id in
-      if replica.port <> self.port then 
-        let host, port = Common.host_port_of_replica replica in
-        Common.with_rpc_conn ~host ~port ~reliable:self.reliable (fun conn -> 
+      if Host_and_port.(replica.address <> self.address) then 
+        Common.with_rpc_conn ~address:replica.address ~reliable:self.reliable (fun conn -> 
           Rpc.Rpc.dispatch_exn rpc conn args)
         else try_with (fun () -> local () args)
     ))
@@ -197,7 +196,7 @@ let status ~min ~instances seq =
     | None -> ForgottenStatus
 
 let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec list) () =
-  let port = (Common.replica_of_id ~id ~replica_set).port in
+  let port = (Common.replica_of_id ~id ~replica_set).address.port in
   Log.Global.debug "Starting server on %d" port;
   let n, min, max, instances = ref 0, ref 0, ref (-1), Hashtbl.create (module Int) in
   let implementations =
