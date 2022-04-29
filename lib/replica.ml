@@ -182,8 +182,6 @@ type instance_status =
   | PendingStatus
   | ForgottenStatus
 
-type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status;}
-
 let minimum ~min () = !min 
 
 let maximum ~max () = !max
@@ -194,6 +192,8 @@ let status ~min ~instances seq =
     | Some Decided v -> DecidedStatus v
     | Some Pending _ -> PendingStatus
     | None -> ForgottenStatus
+
+type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status;}
 
 let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec list) () =
   let port = (Common.replica_of_id ~id ~replica_set).address.port in

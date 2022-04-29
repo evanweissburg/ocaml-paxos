@@ -1,5 +1,4 @@
-open! Core
-open! Async
+open Async
 
 let propose message ~address =
   Common.with_retrying_rpc_conn ~address (fun conn ->

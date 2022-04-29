@@ -44,7 +44,7 @@ let rec with_retrying_rpc_conn ~address ?(reliable=true) f =
   match%bind with_rpc_conn ~address ~reliable f with
   | Ok reply -> return (Some reply)
   | Error RPCFailure -> 
-    let%bind () = Clock.after (sec 0.5) in
+    let%bind () = Clock.after (sec 0.1) in
     with_retrying_rpc_conn ~address ~reliable f
   | Error err -> 
     Log.Global.error "%s" (Exn.to_string err);
