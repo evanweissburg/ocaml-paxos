@@ -66,23 +66,7 @@ let learn_impl ~id ~max ~instances () (args : Protocol.learn_args) =
   return ()
 
 let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances ~rpc_counter () (args:Protocol.propose_args) =
-  let num_replicas = Common.num_replicas ~replica_set in
   let is_majority = Common.is_majority ~replica_set in 
-  let inc_n n' = n := (1 + n' / num_replicas) * num_replicas + id in
-  let sync_n_with_local_acceptor () = match get_instance ~instances args.seq with 
-    | Decided v -> `Decided v
-    | Pending instance -> inc_n !(instance.n_p); `Pending !n in
-  let broadcast_replicas ~rpc ~local ~args = 
-    Deferred.all (
-      List.map replica_set ~f:(fun replica ->
-      rpc_counter := !rpc_counter + 1;
-      let self = Common.replica_of_id ~replica_set ~id in
-      if Host_and_port.(replica.address <> self.address) then 
-        (Common.with_rpc_conn ~replica ~reliable:self.reliable (fun conn -> 
-          Rpc.Rpc.dispatch_exn rpc conn args)
-        ) else try_with (fun () -> local () args)
-    ))
-  in
 
   let prepare_supported results = 
     let is_decided = List.filter results ~f:(fun result ->
@@ -106,11 +90,13 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
       | Ok Protocol.PrepareDecided _ -> failwith "Impossible"
     in
     let majority_value = 
-      let filter_ok acc = function
+      let sorted_accepts = 
+        let filter_ok acc = function
         | Ok Protocol.PrepareOk (_, Some n, Some v) -> (n, v) :: acc
         | _ -> acc in
-      let compare (a, _) (b, _) = a - b in
-      let sorted_accepts = List.sort (List.fold results ~init:[] ~f:filter_ok) ~compare in
+        let compare (a, _) (b, _) = a - b in
+        List.sort (List.fold results ~init:[] ~f:filter_ok) ~compare 
+      in
       let rec loop (max_n, max_v, max_count) (cur_n, cur_v, cur_count) = function
         | [] -> if cur_count > max_count then cur_v, cur_count else max_v, max_count
         | (n, v) :: tl -> 
@@ -132,7 +118,8 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
           Supported max_v
         else 
           NotSupported max_n 
-    in 
+  in 
+
   let accept_supported results =
     let num_supporting = (List.sum (module Int) results ~f:(function 
       | Ok Protocol.AcceptOk _ -> 1 
@@ -140,9 +127,30 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
     in
     is_majority num_supporting 
   in
+  
+  let inc_n n' = 
+    let num_replicas = Common.num_replicas ~replica_set in
+    n := (1 + n' / num_replicas) * num_replicas + id 
+  in
+  let sync_n_with_local_acceptor () = match get_instance ~instances args.seq with 
+    | Decided v -> `Decided v
+    | Pending instance -> inc_n !(instance.n_p); `Pending !n 
+  in
   let local_prepare_impl = prepare_impl ~id ~max ~instances in
   let local_accept_impl = accept_impl ~id ~max ~instances in
   let local_learn_impl = learn_impl ~id ~max ~instances in
+  let broadcast_replicas ~rpc ~local ~args = 
+    Deferred.all (
+      List.map replica_set ~f:(fun replica ->
+      rpc_counter := !rpc_counter + 1;
+      let self = Common.replica_of_id ~replica_set ~id in
+      if Host_and_port.(replica.address <> self.address) then 
+        (Common.with_rpc_conn ~replica ~reliable:self.reliable (fun conn -> 
+          Rpc.Rpc.dispatch_exn rpc conn args)
+        ) else try_with (fun () -> local () args)
+    ))
+  in
+
   let rec propose_aux () =
     match sync_n_with_local_acceptor () with
       | `Decided v -> return v
