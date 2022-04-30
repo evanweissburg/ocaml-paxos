@@ -83,12 +83,12 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
   in
 
   let prepare_supported results = 
-    let decided = List.filter results ~f:(fun result ->
+    let is_decided = List.filter results ~f:(fun result ->
       match result with 
         | Ok Protocol.PrepareDecided _ -> true
         | _ -> false) 
     in
-    match decided with 
+    match is_decided with 
       | (Ok Protocol.PrepareDecided v)::_ -> WasDecided v
       | _ ->
     let check_support result (num_ok, max_n, max_v) =
@@ -133,12 +133,10 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
   in 
 
   let accept_supported results =
-    let f result aux =
-      match result with 
-      | Ok Protocol.AcceptOk _ -> aux + 1
-      | Ok Protocol.AcceptReject | Error _ -> aux
-    in 
-    let num_supporting = (List.fold_right results ~f ~init:0) in
+    let num_supporting = (List.sum (module Int) results ~f:(function 
+      | Ok Protocol.AcceptOk _ -> 1 
+      | Ok Protocol.AcceptReject | Error _ -> 0)) 
+    in
     is_majority num_supporting
   in 
 
