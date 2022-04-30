@@ -222,8 +222,8 @@ let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec l
       )
   in
   Log.Global.debug "Server started, waiting for close";
-  Deferred.any
-    [ (stop >>= fun () -> Tcp.Server.close server)
-    ; Tcp.Server.close_finished server ] 
-  |> Async.don't_wait_for;
+  Deferred.any [
+    (stop >>= fun () -> Tcp.Server.close server); 
+    Tcp.Server.close_finished server;
+    ] |> Async.don't_wait_for;
   {min=minimum ~min; max=maximum ~max; status=status ~min ~instances; rpc_count=rpc_count ~rpc_counter;}
