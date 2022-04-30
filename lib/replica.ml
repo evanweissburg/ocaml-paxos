@@ -7,11 +7,6 @@ type instance =
   | Decided of string
   | Pending of {n_p: int ref; n_a: int option ref; v_a: string option ref}
 
-type prepare_result =
-  | WasDecided of string
-  | Supported of string
-  | NotSupported of int
-
 let get_instance ~instances seq = 
   match Hashtbl.find instances seq with
   | Some instance -> instance
@@ -75,7 +70,7 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
         | _ -> false) 
     in
     match is_decided with 
-      | (Ok Protocol.PrepareDecided v)::_ -> WasDecided v
+      | (Ok Protocol.PrepareDecided v)::_ -> `WasDecided v
       | _ ->
     let check_support result (num_ok, max_n, max_v) =
       match result with 
@@ -111,13 +106,13 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
       let max_v, count = loop (-1, "", 0) (-1, "", 0) sorted_accepts in
       if is_majority count then Some max_v else None in
     match majority_value with 
-      | Some value -> WasDecided value
+      | Some value -> `WasDecided value
       | None -> 
         let num_supporting, max_n, max_v = (List.fold_right results ~f:check_support ~init:(0, -1, args.v)) in
         if is_majority num_supporting then
-          Supported max_v
+          `Supported max_v
         else 
-          NotSupported max_n 
+          `NotSupported max_n 
   in 
 
   let accept_supported results =
@@ -157,14 +152,14 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
       | `Pending n -> 
         let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:{seq=args.seq; n=n} in
         match prepare_supported results with 
-          | WasDecided v -> 
+          | `WasDecided v -> 
             let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
             return v
-          | NotSupported n' ->
+          | `NotSupported n' ->
             inc_n (if n > n' then n else n');
             let%bind () = Clock.after proposer_delay in
             propose_aux ()
-          | Supported v ->
+          | `Supported v ->
             let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:{seq=args.seq; n=n; v=v} in
             if not (accept_supported results) then (
               inc_n n;
