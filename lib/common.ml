@@ -3,6 +3,8 @@ open Async
 
 exception RPCFailure
 
+let rpc_retry_delay = sec 0.1
+
 type replica_spec = {address: Host_and_port.t; reliable: bool; recv_disabled: bool}
 
 let default_replica_set ?(reliable=true) ?(num_recv_disabled=0) () = 
@@ -43,7 +45,7 @@ let rec with_retrying_rpc_conn ~replica ?(reliable=true) f =
   match%bind with_rpc_conn ~replica ~reliable f with
   | Ok reply -> return (Some reply)
   | Error RPCFailure -> 
-    let%bind () = Clock.after (sec 0.1) in
+    let%bind () = Clock.after rpc_retry_delay in
     with_retrying_rpc_conn ~replica ~reliable f
   | Error err -> 
     Log.Global.error "%s" (Exn.to_string err);

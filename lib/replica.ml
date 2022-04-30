@@ -1,6 +1,8 @@
 open Core
 open Async
 
+let proposer_delay = sec 0.1
+
 type instance = 
   | Decided of string
   | Pending of {n_p: int ref; n_a: int option ref; v_a: string option ref}
@@ -129,24 +131,22 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
         if is_majority num_supporting then
           Supported max_v
         else 
-          NotSupported max_n
-  in 
-
+          NotSupported max_n 
+    in 
   let accept_supported results =
     let num_supporting = (List.sum (module Int) results ~f:(function 
       | Ok Protocol.AcceptOk _ -> 1 
       | Ok Protocol.AcceptReject | Error _ -> 0)) 
     in
-    is_majority num_supporting
-  in 
-
+    is_majority num_supporting 
+  in
+  let local_prepare_impl = prepare_impl ~id ~max ~instances in
+  let local_accept_impl = accept_impl ~id ~max ~instances in
+  let local_learn_impl = learn_impl ~id ~max ~instances in
   let rec propose_aux () =
     match sync_n_with_local_acceptor () with
       | `Decided v -> return v
       | `Pending n -> 
-        let local_prepare_impl = prepare_impl ~id ~max ~instances in
-        let local_accept_impl = accept_impl ~id ~max ~instances in
-        let local_learn_impl = learn_impl ~id ~max ~instances in
         let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:{seq=args.seq; n=n} in
         match prepare_supported results with 
           | WasDecided v -> 
@@ -154,13 +154,13 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
             return v
           | NotSupported n' ->
             inc_n (if n > n' then n else n');
-            let%bind () = Clock.after (sec 0.1) in
+            let%bind () = Clock.after proposer_delay in
             propose_aux ()
           | Supported v ->
             let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:{seq=args.seq; n=n; v=v} in
             if not (accept_supported results) then (
               inc_n n;
-              let%bind () = Clock.after (sec 0.1) in
+              let%bind () = Clock.after proposer_delay in
               propose_aux ()
             ) else (
               let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
