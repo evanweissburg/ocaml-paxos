@@ -23,29 +23,28 @@ let replica_of_id ~replica_set ~id =
   | Some replica -> replica
   | None -> failwith (Printf.sprintf "Replica id %d too large for n = %d" id (List.length replica_set))
 
-let with_rpc_conn ~address ~reliable f =
+let with_rpc_conn ~replica ~reliable f =
   try_with (fun () ->
-  let rand_num = Random.int 100 in
-  if not reliable && rand_num < 10 then raise RPCFailure
-  else 
-  Tcp.with_connection
-    (Tcp.Where_to_connect.of_host_and_port address)
-    ~timeout:(sec 1.)
-    (fun _ r w ->
-       match%bind Rpc.Connection.create r w ~connection_state:(fun _ -> ()) with
-       | Error exn -> raise exn
-       | Ok conn  -> 
-        if not reliable && rand_num < 20 then raise RPCFailure
-        else f conn
-    )
+    let rand_num = Random.int 100 in
+    if not reliable && rand_num < 10 || replica.recv_disabled then raise RPCFailure;
+    let%map v = (Tcp.with_connection
+      (Tcp.Where_to_connect.of_host_and_port replica.address)
+      ~timeout:(sec 1.)
+      (fun _ r w ->
+        match%bind Rpc.Connection.create r w ~connection_state:(fun _ -> ()) with
+        | Error exn -> raise exn
+        | Ok conn  -> f conn
+      )) in
+    if not reliable && rand_num < 20 then raise RPCFailure;
+    v
   )
   
-let rec with_retrying_rpc_conn ~address ?(reliable=true) f =
-  match%bind with_rpc_conn ~address ~reliable f with
+let rec with_retrying_rpc_conn ~replica ?(reliable=true) f =
+  match%bind with_rpc_conn ~replica ~reliable f with
   | Ok reply -> return (Some reply)
   | Error RPCFailure -> 
     let%bind () = Clock.after (sec 0.1) in
-    with_retrying_rpc_conn ~address ~reliable f
+    with_retrying_rpc_conn ~replica ~reliable f
   | Error err -> 
     Log.Global.error "%s" (Exn.to_string err);
     return None

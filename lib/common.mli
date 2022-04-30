@@ -13,6 +13,6 @@ val is_majority : replica_set:'a list -> int -> bool
 
 val replica_of_id : replica_set:replica_spec list -> id:int -> replica_spec 
 
-val with_rpc_conn : address:Host_and_port.t -> reliable:bool -> (Rpc.Connection.t -> 'a Deferred.t) -> ('a, exn) result Deferred.t
+val with_rpc_conn : replica:replica_spec -> reliable:bool -> (Rpc.Connection.t -> 'a Deferred.t) -> ('a, exn) result Deferred.t
   
-val with_retrying_rpc_conn : address:Host_and_port.t -> ?reliable:bool -> (Rpc.Connection.t -> 'a Deferred.t) -> 'a option Deferred.t
+val with_retrying_rpc_conn : replica:replica_spec -> ?reliable:bool -> (Rpc.Connection.t -> 'a Deferred.t) -> 'a option Deferred.t

@@ -9,7 +9,7 @@ let propose_values ~(replica_set:Lib.Common.replica_spec list) ~seq ~values =
   Deferred.all (List.mapi values ~f:(fun i proposal ->
     let replica_id = i % (Lib.Common.num_replicas ~replica_set) in
     let replica = Lib.Common.replica_of_id ~replica_set ~id:replica_id in 
-    Lib.Client.propose ~address:replica.address {seq=seq; v=proposal}
+    Lib.Client.propose ~replica {seq=seq; v=proposal}
    ))
 
 let count_decided ~(handles:Lib.Replica.handle list) ~seq ~allowed_vals = 
@@ -33,9 +33,11 @@ let rec wait_majority_decided ~(handles:Lib.Replica.handle list) ~seq ~allowed_v
   else let%bind () = Clock.after (sec 0.1) in 
     wait_majority_decided ~handles ~seq ~allowed_vals
 
+let count_rpcs (handles : Lib.Replica.handle list) = List.fold handles ~init:0 ~f:(fun acc handle -> acc + (handle.rpc_count ()))
+
 let test_basic ~stop () = 
   Log.Global.printf "TEST: test_basic";
-  let replica_set = Lib.Common.default_replica_set ~reliable:true () in
+  let replica_set = Lib.Common.default_replica_set () in
   let%bind handles = start_replicas ~stop ~replica_set in
 
   Log.Global.printf "Single proposer...";
@@ -98,7 +100,7 @@ let test_limp ~stop () =
   Log.Global.printf "TEST: test_limp";
   let replica_set = Lib.Common.default_replica_set ~num_recv_disabled:1 () in
   let%bind handles = start_replicas ~stop ~replica_set in
-  let messages = ["a"; "b"; "c"] in 
+  let messages = ["a"; "b";] in 
   let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
   wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages
 
@@ -133,6 +135,71 @@ let test_many_unreliable ~stop () =
     let%bind _ = propose_values ~replica_set ~seq ~values:messages in
     wait_majority_decided ~handles ~seq ~allowed_vals:messages)
 
+let test_efficient_1 ~stop () = 
+  Log.Global.printf "TEST: test_efficient_1";
+  let replica_set = Lib.Common.default_replica_set () in
+  let%bind handles = start_replicas ~stop ~replica_set in
+
+  Log.Global.printf "Basic consensus takes 3 prepares, 3 accepts, 3 learns...";
+  let messages = ["a"] in 
+  let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
+  let%bind () = wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages in
+  if count_rpcs handles <> 9 then failwith "Wrong number of RPCs issued!!";
+
+  (*Log.Global.printf "Proposer adopts high proposal number from single acceptor...";
+  let replica = match replica_set with
+    | [_; _; two] -> two
+    | _ -> failwith "Impossible"
+  in
+  let prepare_args = Lib.Protocol.{seq=1; n=1000} in
+  let%bind _ = Lib.Common.with_rpc_conn ~address:replica.address ~reliable:true (fun conn -> 
+    Rpc.Rpc.dispatch_exn Lib.Protocol.prepare_rpc conn prepare_args) in
+  let accept_args = Lib.Protocol.{seq=1; n=1000; v="b"} in
+  let%bind _ = Lib.Common.with_rpc_conn ~address:replica.address ~reliable:true (fun conn -> 
+    Rpc.Rpc.dispatch_exn Lib.Protocol.accept_rpc conn accept_args) in
+  let%bind _ = propose_values ~replica_set ~seq:1 ~values:messages in 
+  let%bind () = wait_majority_decided ~handles ~seq:1 ~allowed_vals:["b"] in
+  let total_rpcs = List.fold handles ~init:0 ~f:(fun acc handle -> acc + (handle.rpc_count ())) in 
+  if total_rpcs <> 21 then failwith "Wrong number of RPCs issued!"*)
+
+  Log.Global.printf "Proposer immediately decides after noticing majority...";
+  let other_replicas = match replica_set with
+    | _::tl -> tl
+    | [] -> failwith "Impossible"
+  in
+  let prepare_args = Lib.Protocol.{seq=2; n=2} in
+  let%bind _ = Deferred.all (List.map other_replicas ~f:(fun replica -> 
+    Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
+    Rpc.Rpc.dispatch_exn Lib.Protocol.prepare_rpc conn prepare_args))) in
+  let accept_args = Lib.Protocol.{seq=2; n=2; v="b"} in
+  let%bind _ = Deferred.all (List.map other_replicas ~f:(fun replica -> 
+    Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
+    Rpc.Rpc.dispatch_exn Lib.Protocol.accept_rpc conn accept_args))) in
+  let%bind _ = propose_values ~replica_set ~seq:2 ~values:messages in 
+  let%bind () = wait_majority_decided ~handles ~seq:2 ~allowed_vals:["b"] in
+  if count_rpcs handles <> (9 + 0 + 6) then failwith "Wrong number of RPCs issued!";
+
+  return ()
+
+let test_efficient_2 ~stop () =
+  Log.Global.printf "TEST: test_efficient_2";
+  let replica_set = Lib.Common.default_replica_set ~num_recv_disabled:1 () in
+  let%bind handles = start_replicas ~stop ~replica_set in
+  
+  Log.Global.printf "Proposer immediately decides after noticing decided acceptor...";
+  let replica = match replica_set with
+    | [_; _; two] -> {two with recv_disabled = false}
+    | _ -> failwith "Impossible"
+  in
+  let messages = ["a"] in 
+  let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
+  let%bind () = wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages in
+  let%bind _ = Lib.Client.propose ~replica {seq=0; v="b"} in
+  if count_rpcs handles <> 9 + 6 then failwith "Wrong number of RPCs issued!";
+
+  return ()
+
+
 let run = 
   Log.Global.set_level `Info;
   let tests = [
@@ -142,6 +209,8 @@ let run =
     test_unreliable;
     test_large_cluster_unreliable;
     test_many_unreliable;
+    test_efficient_1;
+    test_efficient_2;
   ] in
   let runnable_tests = List.fold tests ~init:(return ()) ~f:(fun acc test -> 
     let stop_ivar = Ivar.create () in

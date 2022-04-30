@@ -5,6 +5,6 @@ type instance_status =
   | PendingStatus
   | ForgottenStatus
 
-type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status;}
+type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status; rpc_count: unit -> int;}
 
 val start : env:unit -> ?stop:unit Deferred.t -> id:int -> replica_set:Common.replica_spec list -> unit -> handle Deferred.t

@@ -30,9 +30,7 @@ let decide_instance ~instances ~seq ~v =
     )
     | None -> Some decided)
 
-let prepare_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.prepare_args) =
-  let replica = Common.replica_of_id ~replica_set ~id in 
-  if replica.recv_disabled then raise Common.RPCFailure;
+let prepare_impl ~id ~max ~instances () (args : Protocol.prepare_args) =
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
     | Decided v -> return (Protocol.PrepareDecided v)
@@ -45,9 +43,7 @@ let prepare_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () 
         return Protocol.PrepareReject
       )
 
-let accept_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.accept_args) =
-  let replica = Common.replica_of_id ~replica_set ~id in 
-  if replica.recv_disabled then raise Common.RPCFailure;
+let accept_impl ~id ~max ~instances () (args : Protocol.accept_args) =
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
     | Decided _ -> return Protocol.AcceptReject
@@ -61,28 +57,28 @@ let accept_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (
         return Protocol.AcceptReject
       )
 
-let learn_impl ~id ~(replica_set:Common.replica_spec list) ~max ~instances () (args : Protocol.learn_args) =
+let learn_impl ~id ~max ~instances () (args : Protocol.learn_args) =
   Log.Global.debug "%d got learn (v: %s)" id args.v;
-  let replica = Common.replica_of_id ~replica_set ~id in 
-  if replica.recv_disabled then raise Common.RPCFailure else 
   if args.seq > !max then max := args.seq;
   decide_instance ~instances ~seq:args.seq ~v:args.v;
   return ()
 
-let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances () (args:Protocol.propose_args) =
+let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances ~rpc_counter () (args:Protocol.propose_args) =
   let num_replicas = Common.num_replicas ~replica_set in
   let is_majority = Common.is_majority ~replica_set in 
-  let inc_n n' = 
-    n := (1 + n' / num_replicas) * num_replicas + id 
-  in
+  let inc_n n' = n := (1 + n' / num_replicas) * num_replicas + id in
+  let sync_n_with_local_acceptor () = match get_instance ~instances args.seq with 
+    | Decided v -> `Decided v
+    | Pending instance -> inc_n !(instance.n_p); `Pending !n in
   let broadcast_replicas ~rpc ~local ~args = 
     Deferred.all (
       List.map replica_set ~f:(fun replica ->
+      rpc_counter := !rpc_counter + 1;
       let self = Common.replica_of_id ~replica_set ~id in
       if Host_and_port.(replica.address <> self.address) then 
-        Common.with_rpc_conn ~address:replica.address ~reliable:self.reliable (fun conn -> 
+        (Common.with_rpc_conn ~replica ~reliable:self.reliable (fun conn -> 
           Rpc.Rpc.dispatch_exn rpc conn args)
-        else try_with (fun () -> local () args)
+        ) else try_with (fun () -> local () args)
     ))
   in
 
@@ -100,7 +96,9 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
       | Ok Protocol.PrepareOk (_, n, v) -> 
         (match n, v with 
           | Some n, Some v when n > max_n -> (num_ok + 1, n, v)
-          | _ -> (num_ok + 1, max_n, max_v)
+          | Some _, Some _  | None, None -> (num_ok + 1, max_n, max_v)
+          | Some _, None -> failwith "Impossible Some None"
+          | None, Some _ -> failwith "Impossible None Some"
         )
       | Ok Protocol.PrepareReject | Error _ -> (num_ok, max_n, max_v)
       | Ok Protocol.PrepareDecided _ -> failwith "Impossible"
@@ -112,7 +110,7 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
       let compare (a, _) (b, _) = a - b in
       let sorted_accepts = List.sort (List.fold results ~init:[] ~f:filter_ok) ~compare in
       let rec loop (max_n, max_v, max_count) (cur_n, cur_v, cur_count) = function
-        | [] -> max_v, max_count
+        | [] -> if cur_count > max_count then cur_v, cur_count else max_v, max_count
         | (n, v) :: tl -> 
           if n = cur_n then
             loop (max_n, max_v, max_count) (cur_n, cur_v, cur_count+1) tl
@@ -144,37 +142,42 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
     is_majority num_supporting
   in 
 
-  let rec propose_aux () = 
-    let n' = !n in
-    let local_prepare_impl = prepare_impl ~id ~replica_set ~max ~instances in
-    let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:{seq=args.seq; n=n'} in
-    match prepare_supported results with 
-      | WasDecided v -> 
-        decide_instance ~instances ~seq:args.seq ~v;
-        return v
-      | NotSupported n'' ->
-        inc_n (if n' > n'' then n' else n'');
-        propose_aux ()
-      | Supported v ->
-        let local_accept_impl = accept_impl ~id ~replica_set ~max ~instances in
-        let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:{seq=args.seq; n=n'; v=v} in
-        if not (accept_supported results) then (
-          inc_n n';
-          propose_aux ()
-        ) else (
-          let local_learn_impl = learn_impl ~id ~replica_set ~max ~instances in
-          let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
-          return v
-        )
-  in
-  propose_aux ()
+  let rec propose_aux () =
+    match sync_n_with_local_acceptor () with
+      | `Decided v -> return v
+      | `Pending n -> 
+        let local_prepare_impl = prepare_impl ~id ~max ~instances in
+        let local_accept_impl = accept_impl ~id ~max ~instances in
+        let local_learn_impl = learn_impl ~id ~max ~instances in
+        let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:{seq=args.seq; n=n} in
+        match prepare_supported results with 
+          | WasDecided v -> 
+            let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
+            return v
+          | NotSupported n' ->
+            inc_n (if n > n' then n else n');
+            let%bind () = Clock.after (sec 0.1) in
+            propose_aux ()
+          | Supported v ->
+            let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:{seq=args.seq; n=n; v=v} in
+            if not (accept_supported results) then (
+              inc_n n;
+              let%bind () = Clock.after (sec 0.1) in
+              propose_aux ()
+            ) else (
+              let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
+              return v
+            )
+      in
+      propose_aux ()
+          
 
 (* The list of RPC implementations supported by this server *)
-let implementations ~id ~replica_set ~n ~max ~instances=
-  [ Rpc.Rpc.implement Protocol.prepare_rpc (prepare_impl ~id ~replica_set ~max ~instances);
-    Rpc.Rpc.implement Protocol.accept_rpc (accept_impl ~id ~replica_set ~max ~instances);
-    Rpc.Rpc.implement Protocol.learn_rpc (learn_impl ~id ~max ~replica_set ~instances);
-    Rpc.Rpc.implement Protocol.propose_rpc (propose_impl ~id ~max ~replica_set ~n ~instances);
+let implementations ~id ~replica_set ~n ~max ~instances ~rpc_counter =
+  [ Rpc.Rpc.implement Protocol.prepare_rpc (prepare_impl ~id ~max ~instances);
+    Rpc.Rpc.implement Protocol.accept_rpc (accept_impl ~id ~max ~instances);
+    Rpc.Rpc.implement Protocol.learn_rpc (learn_impl ~id ~max ~instances);
+    Rpc.Rpc.implement Protocol.propose_rpc (propose_impl ~id ~max ~replica_set ~n ~instances ~rpc_counter);
   ]
 
 type instance_status = 
@@ -193,14 +196,16 @@ let status ~min ~instances seq =
     | Some Pending _ -> PendingStatus
     | None -> ForgottenStatus
 
-type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status;}
+let rpc_count ~rpc_counter () = !rpc_counter
+
+type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status; rpc_count: unit -> int}
 
 let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec list) () =
   let port = (Common.replica_of_id ~id ~replica_set).address.port in
   Log.Global.debug "Starting server on %d" port;
-  let n, min, max, instances = ref 0, ref 0, ref (-1), Hashtbl.create (module Int) in
+  let n, min, max, instances, rpc_counter = ref 0, ref 0, ref (-1), Hashtbl.create (module Int), ref 0 in
   let implementations =
-    Rpc.Implementations.create_exn ~implementations:(implementations ~id ~replica_set ~n ~max ~instances)
+    Rpc.Implementations.create_exn ~implementations:(implementations ~id ~replica_set ~n ~max ~instances ~rpc_counter)
       ~on_unknown_rpc:(`Call (fun _ ~rpc_tag ~version ->
           Log.Global.error "Unexpected RPC, tag %s, version %d" rpc_tag version;
           `Continue
@@ -223,4 +228,4 @@ let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec l
     [ (stop >>= fun () -> Tcp.Server.close server)
     ; Tcp.Server.close_finished server ] 
   |> Async.don't_wait_for;
-  {min=minimum ~min; max=maximum ~max; status=status ~min ~instances}
+  {min=minimum ~min; max=maximum ~max; status=status ~min ~instances; rpc_count=rpc_count ~rpc_counter;}
