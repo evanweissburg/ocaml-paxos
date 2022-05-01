@@ -144,23 +144,25 @@ let test_efficient_1 ~stop () =
   let messages = ["a"] in 
   let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
   let%bind () = wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages in
+  (* 3 prepare, 3 accept, 3 learn *)
   if count_rpcs handles <> 9 then failwith "Wrong number of RPCs issued!!";
 
-  (*Log.Global.printf "Proposer adopts high proposal number from single acceptor...";
+  Log.Global.printf "Proposer adopts high n_a from single acceptor...";
   let replica = match replica_set with
     | [_; _; two] -> two
     | _ -> failwith "Impossible"
   in
-  let prepare_args = Lib.Protocol.{seq=1; n=1000} in
-  let%bind _ = Lib.Common.with_rpc_conn ~address:replica.address ~reliable:true (fun conn -> 
+  let prepare_args = Lib.Protocol.{seq=1; n=1} in
+  let%bind _ = Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
     Rpc.Rpc.dispatch_exn Lib.Protocol.prepare_rpc conn prepare_args) in
   let accept_args = Lib.Protocol.{seq=1; n=1000; v="b"} in
-  let%bind _ = Lib.Common.with_rpc_conn ~address:replica.address ~reliable:true (fun conn -> 
+  let%bind _ = Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
     Rpc.Rpc.dispatch_exn Lib.Protocol.accept_rpc conn accept_args) in
   let%bind _ = propose_values ~replica_set ~seq:1 ~values:messages in 
   let%bind () = wait_majority_decided ~handles ~seq:1 ~allowed_vals:["b"] in
   let total_rpcs = List.fold handles ~init:0 ~f:(fun acc handle -> acc + (handle.rpc_count ())) in 
-  if total_rpcs <> 21 then failwith "Wrong number of RPCs issued!"*)
+  (* 9 from earlier; then 3 prepare, 3 accept, 3 learn *)
+  if total_rpcs <> 9 + 9 then failwith "Wrong number of RPCs issued!";
 
   Log.Global.printf "Proposer immediately decides after noticing majority...";
   let other_replicas = match replica_set with
@@ -177,7 +179,8 @@ let test_efficient_1 ~stop () =
     Rpc.Rpc.dispatch_exn Lib.Protocol.accept_rpc conn accept_args))) in
   let%bind _ = propose_values ~replica_set ~seq:2 ~values:messages in 
   let%bind () = wait_majority_decided ~handles ~seq:2 ~allowed_vals:["b"] in
-  if count_rpcs handles <> (9 + 0 + 6) then failwith "Wrong number of RPCs issued!";
+  (* 18 from earlier; then 3 prepare, 3 learn *)
+  if count_rpcs handles <> (9 + 9 + 6) then failwith "Wrong number of RPCs issued!";
 
   return ()
 
@@ -195,6 +198,7 @@ let test_efficient_2 ~stop () =
   let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
   let%bind () = wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages in
   let%bind _ = Lib.Client.propose ~replica {seq=0; v="b"} in
+  (* 9 from limp consensus; then 3 prepare, 3 learn *)
   if count_rpcs handles <> 9 + 6 then failwith "Wrong number of RPCs issued!";
 
   return ()
