@@ -49,8 +49,9 @@ let set_done ~done_estimates ~min ~instances ~id seq =
   in 
   forget ()
 
-let prepare_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : Protocol.prepare_args * Protocol.done_info) =
-  set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq;
+let prepare_impl ~id ~min ~max ~instances ~done_estimates () (args, args_done_info : Protocol.prepare_args * Protocol.done_info) =
+  set_done ~done_estimates ~min ~instances ~id:args_done_info.sender args_done_info.seq;
+  let done_info = get_done_info ~done_estimates ~id in
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
     | Decided v -> return (Protocol.PrepareDecided v, done_info)
@@ -63,8 +64,8 @@ let prepare_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : 
         return (Protocol.PrepareReject, done_info)
       )
 
-let accept_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : Protocol.accept_args * Protocol.done_info) =
-  set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq;
+let accept_impl ~id ~min ~max ~instances ~done_estimates () (args, args_done_info : Protocol.accept_args * Protocol.done_info) =
+  set_done ~done_estimates ~min ~instances ~id:args_done_info.sender args_done_info.seq;
   let done_info = get_done_info ~done_estimates ~id in
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
@@ -79,9 +80,10 @@ let accept_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : P
         return (Protocol.AcceptReject, done_info)
       )
 
-let learn_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : Protocol.learn_args * Protocol.done_info) =
+let learn_impl ~id ~min ~max ~instances ~done_estimates () (args, args_done_info : Protocol.learn_args * Protocol.done_info) =
   Log.Global.debug "%d got learn (v: %s)" id args.v;
-  set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq;
+  set_done ~done_estimates ~min ~instances ~id:args_done_info.sender args_done_info.seq;
+  let done_info = get_done_info ~done_estimates ~id in
   if args.seq > !max then max := args.seq;
   decide_instance ~instances ~seq:args.seq ~v:args.v;
   return ((), done_info)
@@ -92,28 +94,28 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~min ~max ~n ~insta
   let prepare_supported results = 
     let is_decided = List.filter results ~f:(fun result ->
       match result with 
-        | Ok (Protocol.PrepareDecided _, _) -> true
+        | Protocol.PrepareDecided _ -> true
         | _ -> false) 
     in
     match is_decided with 
-      | Ok (Protocol.PrepareDecided v, _)::_ -> `WasDecided v
+      | (Protocol.PrepareDecided v)::_ -> `WasDecided v
       | _ ->
     let check_support result (num_ok, max_n, max_v) =
       match result with 
-      | Ok (Protocol.PrepareOk (_, n, v), _) -> 
+      | Protocol.PrepareOk (_, n, v) -> 
         (match n, v with 
           | Some n, Some v when n > max_n -> (num_ok + 1, n, v)
           | Some _, Some _  | None, None -> (num_ok + 1, max_n, max_v)
           | Some _, None -> failwith "Impossible Some None"
           | None, Some _ -> failwith "Impossible None Some"
         )
-      | Ok (Protocol.PrepareReject, _) | Error _ -> (num_ok, max_n, max_v)
-      | Ok (Protocol.PrepareDecided _, _) -> failwith "Impossible"
+      | Protocol.PrepareReject -> (num_ok, max_n, max_v)
+      | Protocol.PrepareDecided _ -> failwith "Impossible"
     in
     let majority_value = 
       let sorted_accepts = 
         let filter_ok acc = function
-        | Ok (Protocol.PrepareOk (_, Some n, Some v), _) -> (n, v) :: acc
+        | Protocol.PrepareOk (_, Some n, Some v) -> (n, v) :: acc
         | _ -> acc in
         let compare (a, _) (b, _) = a - b in
         List.sort (List.fold results ~init:[] ~f:filter_ok) ~compare 
@@ -143,8 +145,8 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~min ~max ~n ~insta
 
   let accept_supported results =
     let num_supporting = (List.sum (module Int) results ~f:(function 
-      | Ok (Protocol.AcceptOk _, _) -> 1 
-      | Ok (Protocol.AcceptReject, _) | Error _ -> 0)) 
+      | Protocol.AcceptOk _ -> 1 
+      | Protocol.AcceptReject -> 0)) 
     in
     is_majority num_supporting 
   in
@@ -160,12 +162,19 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~min ~max ~n ~insta
   let local_prepare_impl = prepare_impl ~id ~min ~max ~instances ~done_estimates in
   let local_accept_impl = accept_impl ~id ~min ~max ~instances ~done_estimates in
   let local_learn_impl = learn_impl ~id ~min ~max ~instances ~done_estimates in
-  let set_done_infos results = 
-    List.iter results ~f:(fun result -> 
-      match result with 
-      | Ok (_, (done_info:Protocol.done_info)) -> set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq
-      | Error _ -> ()
-    ) in 
+  let apply_done_info results = 
+    let filter_ok results = 
+      List.fold results ~init:[] ~f:(fun acc result ->
+        match result with
+        | Ok result -> result :: acc
+        | Error _ -> acc)
+      in
+    let set_done_infos results = 
+      List.map results ~f:(fun (result, (done_info:Protocol.done_info)) -> 
+        set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq; result
+      ) in 
+    results |> filter_ok |> set_done_infos
+    in
   let broadcast_replicas ~rpc ~local ~args = 
     Deferred.all (
       List.map replica_set ~f:(fun replica ->
@@ -175,7 +184,7 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~min ~max ~n ~insta
         (Common.with_rpc_conn ~replica ~reliable:self.reliable (fun conn -> 
           Rpc.Rpc.dispatch_exn rpc conn args)
         ) else try_with (fun () -> local () args)
-    ))
+    )) >>| apply_done_info
   in
 
   let rec propose_aux () =
@@ -185,7 +194,6 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~min ~max ~n ~insta
         let done_info = get_done_info ~done_estimates ~id in
         let prepare_args = Protocol.{seq=args.seq; n}, done_info in
         let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:prepare_args in
-        set_done_infos results;
         match prepare_supported results with 
           | `WasDecided v -> 
             let done_info = get_done_info ~done_estimates ~id in
