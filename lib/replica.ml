@@ -27,67 +27,93 @@ let decide_instance ~instances ~seq ~v =
     )
     | None -> Some decided)
 
-let prepare_impl ~id ~max ~instances () (args : Protocol.prepare_args) =
+let get_done_info ~done_estimates ~id = 
+  match Hashtbl.find done_estimates id with 
+  | Some estimate -> Protocol.{sender=id; seq=estimate}
+  | None -> Protocol.{sender=id; seq=(-1)}
+
+let set_done ~done_estimates ~min ~instances ~id seq =
+  Hashtbl.change done_estimates id ~f:(fun estimate -> 
+    match estimate with 
+    | Some estimate -> Some (if seq > estimate then seq else estimate)
+    | None -> failwith "Impossible"
+    );
+  let min_done_estimate = Hashtbl.fold done_estimates ~init:seq ~f:(fun ~key ~data min -> 
+    ignore key; if data < min then data else min) in
+  let rec forget () = 
+    if !min <= min_done_estimate then (
+      Hashtbl.remove instances !min;
+      min := !min + 1;
+      forget ()
+    ) else ()
+  in 
+  forget ()
+
+let prepare_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : Protocol.prepare_args * Protocol.done_info) =
+  set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq;
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
-    | Decided v -> return (Protocol.PrepareDecided v)
+    | Decided v -> return (Protocol.PrepareDecided v, done_info)
     | Pending instance -> 
       if args.n > !(instance.n_p) then (
         instance.n_p := args.n;
         Log.Global.debug "%d accepted prepare (n: %d)" id args.n;
-        return (Protocol.PrepareOk (args.n, !(instance.n_a), !(instance.v_a)))
+        return ((Protocol.PrepareOk (args.n, !(instance.n_a), !(instance.v_a))), done_info)
       ) else (
-        return Protocol.PrepareReject
+        return (Protocol.PrepareReject, done_info)
       )
 
-let accept_impl ~id ~max ~instances () (args : Protocol.accept_args) =
+let accept_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : Protocol.accept_args * Protocol.done_info) =
+  set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq;
+  let done_info = get_done_info ~done_estimates ~id in
   if args.seq > !max then max := args.seq;
   match get_instance ~instances args.seq with
-    | Decided _ -> return Protocol.AcceptReject
+    | Decided _ -> return (Protocol.AcceptReject, done_info)
     | Pending instance ->
       if args.n >= !(instance.n_p) then (
         Log.Global.debug "%d accepted accept (n: %d, v: %s)" id args.n args.v;
         instance.n_a := Some args.n;
         instance.v_a := Some args.v;
-        return (Protocol.AcceptOk args.n)
+        return ((Protocol.AcceptOk args.n), done_info)
       ) else (
-        return Protocol.AcceptReject
+        return (Protocol.AcceptReject, done_info)
       )
 
-let learn_impl ~id ~max ~instances () (args : Protocol.learn_args) =
+let learn_impl ~id ~min ~max ~instances ~done_estimates () (args, done_info : Protocol.learn_args * Protocol.done_info) =
   Log.Global.debug "%d got learn (v: %s)" id args.v;
+  set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq;
   if args.seq > !max then max := args.seq;
   decide_instance ~instances ~seq:args.seq ~v:args.v;
-  return ()
+  return ((), done_info)
 
-let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances ~rpc_counter () (args:Protocol.propose_args) =
+let propose_impl ~id ~(replica_set:Common.replica_spec list) ~min ~max ~n ~instances ~done_estimates ~rpc_counter () (args: Protocol.propose_args) =
   let is_majority = Common.is_majority ~replica_set in 
 
   let prepare_supported results = 
     let is_decided = List.filter results ~f:(fun result ->
       match result with 
-        | Ok Protocol.PrepareDecided _ -> true
+        | Ok (Protocol.PrepareDecided _, _) -> true
         | _ -> false) 
     in
     match is_decided with 
-      | (Ok Protocol.PrepareDecided v)::_ -> `WasDecided v
+      | Ok (Protocol.PrepareDecided v, _)::_ -> `WasDecided v
       | _ ->
     let check_support result (num_ok, max_n, max_v) =
       match result with 
-      | Ok Protocol.PrepareOk (_, n, v) -> 
+      | Ok (Protocol.PrepareOk (_, n, v), _) -> 
         (match n, v with 
           | Some n, Some v when n > max_n -> (num_ok + 1, n, v)
           | Some _, Some _  | None, None -> (num_ok + 1, max_n, max_v)
           | Some _, None -> failwith "Impossible Some None"
           | None, Some _ -> failwith "Impossible None Some"
         )
-      | Ok Protocol.PrepareReject | Error _ -> (num_ok, max_n, max_v)
-      | Ok Protocol.PrepareDecided _ -> failwith "Impossible"
+      | Ok (Protocol.PrepareReject, _) | Error _ -> (num_ok, max_n, max_v)
+      | Ok (Protocol.PrepareDecided _, _) -> failwith "Impossible"
     in
     let majority_value = 
       let sorted_accepts = 
         let filter_ok acc = function
-        | Ok Protocol.PrepareOk (_, Some n, Some v) -> (n, v) :: acc
+        | Ok (Protocol.PrepareOk (_, Some n, Some v), _) -> (n, v) :: acc
         | _ -> acc in
         let compare (a, _) (b, _) = a - b in
         List.sort (List.fold results ~init:[] ~f:filter_ok) ~compare 
@@ -117,8 +143,8 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
 
   let accept_supported results =
     let num_supporting = (List.sum (module Int) results ~f:(function 
-      | Ok Protocol.AcceptOk _ -> 1 
-      | Ok Protocol.AcceptReject | Error _ -> 0)) 
+      | Ok (Protocol.AcceptOk _, _) -> 1 
+      | Ok (Protocol.AcceptReject, _) | Error _ -> 0)) 
     in
     is_majority num_supporting 
   in
@@ -131,9 +157,15 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
     | Decided v -> `Decided v
     | Pending instance -> inc_n !(instance.n_p); `Pending !n 
   in
-  let local_prepare_impl = prepare_impl ~id ~max ~instances in
-  let local_accept_impl = accept_impl ~id ~max ~instances in
-  let local_learn_impl = learn_impl ~id ~max ~instances in
+  let local_prepare_impl = prepare_impl ~id ~min ~max ~instances ~done_estimates in
+  let local_accept_impl = accept_impl ~id ~min ~max ~instances ~done_estimates in
+  let local_learn_impl = learn_impl ~id ~min ~max ~instances ~done_estimates in
+  let set_done_infos results = 
+    List.iter results ~f:(fun result -> 
+      match result with 
+      | Ok (_, (done_info:Protocol.done_info)) -> set_done ~done_estimates ~min ~instances ~id:done_info.sender done_info.seq
+      | Error _ -> ()
+    ) in 
   let broadcast_replicas ~rpc ~local ~args = 
     Deferred.all (
       List.map replica_set ~f:(fun replica ->
@@ -150,23 +182,32 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
     match sync_n_with_local_acceptor () with
       | `Decided v -> return v
       | `Pending n -> 
-        let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:{seq=args.seq; n=n} in
+        let done_info = get_done_info ~done_estimates ~id in
+        let prepare_args = Protocol.{seq=args.seq; n}, done_info in
+        let%bind results = broadcast_replicas ~rpc:Protocol.prepare_rpc ~local:local_prepare_impl ~args:prepare_args in
+        set_done_infos results;
         match prepare_supported results with 
           | `WasDecided v -> 
-            let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
+            let done_info = get_done_info ~done_estimates ~id in
+            let learn_args = Protocol.{seq=args.seq; v}, done_info in 
+            let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:learn_args in
             return v
           | `NotSupported n' ->
             inc_n (if n > n' then n else n');
             let%bind () = Clock.after proposer_delay in
             propose_aux ()
           | `Supported v ->
-            let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:{seq=args.seq; n=n; v=v} in
+            let done_info = get_done_info ~done_estimates ~id in
+            let accept_args = Protocol.{seq=args.seq; n; v}, done_info in
+            let%bind results = broadcast_replicas ~rpc:Protocol.accept_rpc ~local:local_accept_impl ~args:accept_args in
             if not (accept_supported results) then (
               inc_n n;
               let%bind () = Clock.after proposer_delay in
               propose_aux ()
             ) else (
-              let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:{seq=args.seq; v} in
+              let done_info = get_done_info ~done_estimates ~id in
+              let learn_args = Protocol.{seq=args.seq; v}, done_info in
+              let%bind _ = broadcast_replicas ~rpc:Protocol.learn_rpc ~local:local_learn_impl ~args:learn_args in
               return v
             )
       in
@@ -174,11 +215,11 @@ let propose_impl ~id ~(replica_set:Common.replica_spec list) ~max ~n ~instances 
           
 
 (* The list of RPC implementations supported by this server *)
-let implementations ~id ~replica_set ~n ~max ~instances ~rpc_counter =
-  [ Rpc.Rpc.implement Protocol.prepare_rpc (prepare_impl ~id ~max ~instances);
-    Rpc.Rpc.implement Protocol.accept_rpc (accept_impl ~id ~max ~instances);
-    Rpc.Rpc.implement Protocol.learn_rpc (learn_impl ~id ~max ~instances);
-    Rpc.Rpc.implement Protocol.propose_rpc (propose_impl ~id ~max ~replica_set ~n ~instances ~rpc_counter);
+let implementations ~id ~replica_set ~n ~min ~max ~instances ~done_estimates ~rpc_counter =
+  [ Rpc.Rpc.implement Protocol.prepare_rpc (prepare_impl ~id ~min ~max ~instances ~done_estimates);
+    Rpc.Rpc.implement Protocol.accept_rpc (accept_impl ~id ~min ~max ~instances ~done_estimates);
+    Rpc.Rpc.implement Protocol.learn_rpc (learn_impl ~id ~min ~max ~instances ~done_estimates);
+    Rpc.Rpc.implement Protocol.propose_rpc (propose_impl ~id ~min ~max ~replica_set ~n ~instances ~done_estimates ~rpc_counter);
   ]
 
 type instance_status = 
@@ -199,14 +240,17 @@ let status ~min ~instances seq =
 
 let rpc_count ~rpc_counter () = !rpc_counter
 
-type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status; rpc_count: unit -> int}
+type handle = {min: unit -> int; max: unit -> int; status: int -> instance_status; rpc_count: unit -> int; set_done: int -> unit}
 
 let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec list) () =
   let port = (Common.replica_of_id ~id ~replica_set).address.port in
   Log.Global.debug "Starting server on %d" port;
-  let n, min, max, instances, rpc_counter = ref 0, ref 0, ref (-1), Hashtbl.create (module Int), ref 0 in
+  let n, min, max = ref 0, ref 0, ref 0 in
+  let instances, done_estimates = Hashtbl.create (module Int), Hashtbl.create (module Int) in 
+  List.iteri replica_set ~f:(fun i _ -> Hashtbl.change done_estimates i ~f:(fun _ -> Some (-1)));
+  let rpc_counter = ref 0 in
   let implementations =
-    Rpc.Implementations.create_exn ~implementations:(implementations ~id ~replica_set ~n ~max ~instances ~rpc_counter)
+    Rpc.Implementations.create_exn ~implementations:(implementations ~id ~replica_set ~n ~min ~max ~instances ~done_estimates ~rpc_counter)
       ~on_unknown_rpc:(`Call (fun _ ~rpc_tag ~version ->
           Log.Global.error "Unexpected RPC, tag %s, version %d" rpc_tag version;
           `Continue
@@ -229,4 +273,4 @@ let start ~env ?(stop=Deferred.never ()) ~id ~(replica_set:Common.replica_spec l
     (stop >>= fun () -> Tcp.Server.close server); 
     Tcp.Server.close_finished server;
     ] |> Async.don't_wait_for;
-  {min=minimum ~min; max=maximum ~max; status=status ~min ~instances; rpc_count=rpc_count ~rpc_counter;}
+  {min=minimum ~min; max=maximum ~max; status=status ~min ~instances; rpc_count=rpc_count ~rpc_counter; set_done=set_done ~done_estimates ~min ~instances ~id;}

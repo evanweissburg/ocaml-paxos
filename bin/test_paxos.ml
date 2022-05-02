@@ -96,6 +96,32 @@ let test_propose_values ~stop () =
     | None -> failwith "RPC failed in unknown way")) in
   wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages
 
+let test_forget ~stop () =
+  Log.Global.printf "TEST: test_forget";
+  let replica_set = Lib.Common.default_replica_set () in
+  let%bind handles = start_replicas ~stop ~replica_set in
+  let messages = ["a"; "b"; "c"] in 
+  let%bind _ = propose_values ~replica_set ~seq:0 ~values:messages in
+  let%bind () = wait_majority_decided ~handles ~seq:0 ~allowed_vals:messages in
+  List.iteri handles ~f:(fun i handle -> if i = 0 then handle.set_done 0);
+
+  let mins = List.map handles ~f:(fun handle -> handle.min ()) in
+  if List.exists mins ~f:(fun min -> min <> 0) then failwith "Forgot too early!";
+
+  List.iter handles ~f:(fun handle -> handle.set_done 0);
+  let%bind _ = propose_values ~replica_set ~seq:1 ~values:messages in
+  let%bind () = wait_majority_decided ~handles ~seq:1 ~allowed_vals:messages in
+
+  let mins = List.map handles ~f:(fun handle -> handle.min ()) in
+  if List.exists mins ~f:(fun min -> min <> 1) then failwith "Did not forget properly!";
+
+  let statuses = List.map handles ~f:(fun handle -> handle.status 0) in
+  if List.exists statuses ~f:(fun status -> 
+    match status with Lib.Replica.ForgottenStatus -> false | _ -> true) 
+    then failwith "Status not correct after forgetting!";
+
+  return ()
+
 let test_limp ~stop () = 
   Log.Global.printf "TEST: test_limp";
   let replica_set = Lib.Common.default_replica_set ~num_recv_disabled:1 () in
@@ -152,10 +178,11 @@ let test_efficient_1 ~stop () =
     | [_; _; two] -> two
     | _ -> failwith "Impossible"
   in
-  let prepare_args = Lib.Protocol.{seq=1; n=1} in
+  let done_info = Lib.Protocol.{sender=0; seq=(-1)} in
+  let prepare_args = Lib.Protocol.{seq=1; n=1}, done_info in
   let%bind _ = Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
     Rpc.Rpc.dispatch_exn Lib.Protocol.prepare_rpc conn prepare_args) in
-  let accept_args = Lib.Protocol.{seq=1; n=1000; v="b"} in
+  let accept_args = Lib.Protocol.{seq=1; n=1000; v="b"}, done_info in
   let%bind _ = Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
     Rpc.Rpc.dispatch_exn Lib.Protocol.accept_rpc conn accept_args) in
   let%bind _ = propose_values ~replica_set ~seq:1 ~values:messages in 
@@ -169,11 +196,11 @@ let test_efficient_1 ~stop () =
     | _::tl -> tl
     | [] -> failwith "Impossible"
   in
-  let prepare_args = Lib.Protocol.{seq=2; n=2} in
+  let prepare_args = Lib.Protocol.{seq=2; n=2}, done_info in
   let%bind _ = Deferred.all (List.map other_replicas ~f:(fun replica -> 
     Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
     Rpc.Rpc.dispatch_exn Lib.Protocol.prepare_rpc conn prepare_args))) in
-  let accept_args = Lib.Protocol.{seq=2; n=2; v="b"} in
+  let accept_args = Lib.Protocol.{seq=2; n=2; v="b"}, done_info in
   let%bind _ = Deferred.all (List.map other_replicas ~f:(fun replica -> 
     Lib.Common.with_rpc_conn ~replica ~reliable:true (fun conn -> 
     Rpc.Rpc.dispatch_exn Lib.Protocol.accept_rpc conn accept_args))) in
@@ -210,6 +237,7 @@ let run =
     test_basic;
     test_propose_values;
     test_limp;
+    test_forget;
     test_unreliable;
     test_large_cluster_unreliable;
     test_many_unreliable;
