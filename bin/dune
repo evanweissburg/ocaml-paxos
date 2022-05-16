@@ -1,5 +1,5 @@
 (executables
  (names test_paxos run_replica run_client)
- (libraries lib core async)
+ (libraries lib core core_unix.command_unix async)
  (preprocess
   (pps ppx_jane)))
