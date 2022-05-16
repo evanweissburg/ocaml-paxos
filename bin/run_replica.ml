@@ -1,9 +1,12 @@
 open Async
 
 let command =
-  Command.async ~summary:"Paxos replica"
+  Command.async
+    ~summary:"Paxos replica"
     (let%map_open.Command id =
-       flag "-id" (required int)
+       flag
+         "-id"
+         (required int)
          ~doc:"int Replica's index in the (hardcoded) list of ports"
      in
      fun () ->
@@ -12,5 +15,6 @@ let command =
          Lib.Replica.start ~env:() ~id ~replica_set ()
        in
        Deferred.never ())
+;;
 
 let () = Command_unix.run command
