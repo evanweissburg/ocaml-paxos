@@ -29,7 +29,7 @@ let decide_instance ~instances ~seq ~v =
         (match instance with
         | Decided v' ->
           if String.(v <> v')
-          then failwith "Instance already decided with different value!"
+          then assert false (* Instance already decided with different value *)
           else Some decided
         | Pending _ -> Some decided)
       | None -> Some decided)
@@ -45,7 +45,7 @@ let set_done ~done_estimates ~min ~instances ~id seq =
   Hashtbl.change done_estimates id ~f:(fun estimate ->
       match estimate with
       | Some estimate -> Some (if seq > estimate then seq else estimate)
-      | None -> failwith "Impossible");
+      | None -> assert false (* Done estimates should be pre-initialized *));
   let min_done_estimate =
     Hashtbl.fold done_estimates ~init:seq ~f:(fun ~key ~data min ->
         ignore key;
@@ -140,34 +140,35 @@ let propose_impl
   =
   let is_majority = Common.is_majority ~replica_set in
   let prepare_supported results =
-    let is_decided =
-      List.filter results ~f:(fun result ->
+    let decided =
+      List.reduce results ~f:(fun acc result ->
           match result with
-          | Protocol.PrepareDecided _ -> true
-          | _ -> false)
+          | Protocol.PrepareDecided v -> Protocol.PrepareDecided v
+          | Protocol.PrepareOk _ | Protocol.PrepareReject -> acc)
     in
-    match is_decided with
-    | Protocol.PrepareDecided v :: _ -> `WasDecided v
-    | _ ->
+    match decided with
+    | Some (Protocol.PrepareDecided v) -> `WasDecided v
+    | Some (Protocol.PrepareOk _ | Protocol.PrepareReject) | None ->
       let check_support result (num_ok, max_n, max_v) =
         match result with
         | Protocol.PrepareOk (_, n, v) ->
           (match n, v with
           | Some n, Some v when n > max_n -> num_ok + 1, n, v
           | Some _, Some _ | None, None -> num_ok + 1, max_n, max_v
-          | Some _, None -> failwith "Impossible Some None"
-          | None, Some _ -> failwith "Impossible None Some")
+          | Some _, None -> assert false (* n_a and v_a are set together *)
+          | None, Some _ -> assert false (* n_a and v_a are set together *))
         | Protocol.PrepareReject -> num_ok, max_n, max_v
-        | Protocol.PrepareDecided _ -> failwith "Impossible"
+        | Protocol.PrepareDecided _ -> assert false (* already checked for any decided *)
       in
       let majority_value =
         let sorted_accepts =
-          let filter_ok acc = function
-            | Protocol.PrepareOk (_, Some n, Some v) -> (n, v) :: acc
-            | _ -> acc
+          let extract_accept = function
+            | Protocol.PrepareOk (_, Some n, Some v) -> Some (n, v)
+            | Protocol.PrepareOk (_, _, _)
+            | Protocol.PrepareReject | Protocol.PrepareDecided _ -> None
           in
           let compare (a, _) (b, _) = a - b in
-          List.sort (List.fold results ~init:[] ~f:filter_ok) ~compare
+          List.filter_map results ~f:extract_accept |> List.sort ~compare
         in
         let rec loop (max_n, max_v, max_count) (cur_n, cur_v, cur_count) = function
           | [] -> if cur_count > max_count then cur_v, cur_count else max_v, max_count

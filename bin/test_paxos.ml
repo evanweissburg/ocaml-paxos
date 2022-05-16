@@ -17,17 +17,17 @@ let propose_values ~(replica_set : Lib.Common.replica_spec list) ~seq ~values =
 
 let count_decided ~(handles : Lib.Replica.handle list) ~seq ~allowed_vals =
   let statuses = List.map handles ~f:(fun handle -> handle.status seq) in
-  let filter_decided acc = function
-    | Lib.Replica.DecidedStatus v -> v :: acc
-    | _ -> acc
+  let filter_decided = function
+    | Lib.Replica.DecidedStatus v -> Some v
+    | Lib.Replica.PendingStatus | Lib.Replica.ForgottenStatus -> None
   in
-  let committed = List.fold statuses ~init:[] ~f:filter_decided in
+  let committed = List.filter_map statuses ~f:filter_decided in
   match committed with
   | [] -> return 0
   | hd :: tl ->
     let%map () = Log.Global.flushed () in
     if not (List.exists allowed_vals ~f:(fun commit -> String.(commit = hd)))
-    then failwith "Commited value not allowed!"
+    then failwith "Committed value not allowed!"
     else (
       let filtered = List.filter tl ~f:(fun commit -> String.(commit <> hd)) in
       if List.length filtered <> 0
