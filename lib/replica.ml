@@ -16,40 +16,31 @@ let get_instance ~instances seq =
   | Some instance -> instance
   | None ->
     let instance = Pending { n_p = ref 0; n_a = ref None; v_a = ref None } in
-    (match Hashtbl.add instances ~key:seq ~data:instance with
-    | `Duplicate | `Ok -> instance)
+    Hashtbl.add_exn instances ~key:seq ~data:instance;
+    instance
 ;;
 
 let decide_instance ~instances ~seq ~v =
   Log.Global.debug "Deciding on (v: %s)" v;
-  let decided = Decided v in
+  let decided_v = Some (Decided v) in
   Hashtbl.change instances seq ~f:(fun instance ->
       match instance with
-      | Some instance ->
-        (match instance with
-        | Decided v' ->
-          if String.(v <> v')
-          then assert false (* Instance already decided with different value *)
-          else Some decided
-        | Pending _ -> Some decided)
-      | None -> Some decided)
+      | Some (Decided v') ->
+        if String.(v <> v')
+        then assert false (* Instance already decided with different value *)
+        else decided_v
+      | Some (Pending _) | None -> decided_v)
 ;;
 
 let get_done_info ~done_estimates ~id =
-  match Hashtbl.find done_estimates id with
-  | Some estimate -> Protocol.{ sender = id; seq = estimate }
-  | None -> Protocol.{ sender = id; seq = -1 }
+  Protocol.{ sender = id; seq = done_estimates.(id) }
 ;;
 
 let set_done ~done_estimates ~min ~instances ~id seq =
-  Hashtbl.change done_estimates id ~f:(fun estimate ->
-      match estimate with
-      | Some estimate -> Some (if seq > estimate then seq else estimate)
-      | None -> assert false (* Done estimates should be pre-initialized *));
+  if seq > done_estimates.(id) then done_estimates.(id) <- seq;
   let min_done_estimate =
-    Hashtbl.fold done_estimates ~init:seq ~f:(fun ~key ~data min ->
-        ignore key;
-        if data < min then data else min)
+    Array.fold done_estimates ~init:seq ~f:(fun min estimate ->
+        if estimate < min then estimate else min)
   in
   let rec forget () =
     if !min <= min_done_estimate
@@ -79,8 +70,8 @@ let prepare_impl
   | Pending instance ->
     if args.n > !(instance.n_p)
     then (
-      instance.n_p := args.n;
       Log.Global.debug "%d accepted prepare (n: %d)" id args.n;
+      instance.n_p := args.n;
       return (Protocol.PrepareOk (args.n, !(instance.n_a), !(instance.v_a)), done_info))
     else return (Protocol.PrepareReject, done_info)
 ;;
@@ -155,8 +146,7 @@ let propose_impl
           (match n, v with
           | Some n, Some v when n > max_n -> num_ok + 1, n, v
           | Some _, Some _ | None, None -> num_ok + 1, max_n, max_v
-          | Some _, None -> assert false (* n_a and v_a are set together *)
-          | None, Some _ -> assert false (* n_a and v_a are set together *))
+          | Some _, None | None, Some _ -> assert false (* n_a and v_a are set together *))
         | Protocol.PrepareReject -> num_ok, max_n, max_v
         | Protocol.PrepareDecided _ -> assert false (* already checked for any decided *)
       in
@@ -351,11 +341,10 @@ let start
   let port = (Common.replica_of_id ~id ~replica_set).address.port in
   Log.Global.debug "Starting server on %d" port;
   let n, min, max = ref 0, ref 0, ref 0 in
+  let num_replicas = Common.num_replicas ~replica_set in
   let instances, done_estimates =
-    Hashtbl.create (module Int), Hashtbl.create (module Int)
+    Hashtbl.create (module Int), Array.create ~len:num_replicas (-1)
   in
-  List.iteri replica_set ~f:(fun i _ ->
-      Hashtbl.change done_estimates i ~f:(fun _ -> Some (-1)));
   let rpc_counter = ref 0 in
   let implementations =
     Rpc.Implementations.create_exn
